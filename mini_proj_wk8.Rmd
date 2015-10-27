@@ -1,0 +1,245 @@
+---
+title: "mini proj wk8-9"
+author: "Aaron Palumbo"
+date: "October 23, 2015"
+output: pdf_document
+---
+
+## Dependencies
+
+```{r}
+library(dplyr)
+# global chunk options
+knitr::opts_chunk$set(warning=FALSE)
+```
+
+## Data
+
+We're going to work with a dataset from the UCI Machine Learning Repository on diabetes patients (https://archive.ics.uci.edu/ml/datasets/Diabetes+130-US+hospitals+for+years+1999-2008).
+
+```{r}
+dd <-read.csv("dataset_diabetes/diabetic_data.csv",
+              stringsAsFactors = FALSE, na.strings = "?")
+# Right away we can get rid of columns without much info
+dd = dd[ , -caret::nearZeroVar(dd)]
+
+# We can also drop any id columns, since those should be 
+# unique identifiers and not useful for clustering
+idCols <- c("encounter_id", "patient_nbr")
+dd = dd[ , !(names(dd) %in% idCols)]
+```
+
+## Data Cleaning
+
+We are going to apply the hamming distance to these points so we want to convert all our columns to categorical data (factors). Let's take a look at what we have to start with.
+
+```{r}
+getInfo <- function(dd) {
+  return(do.call(rbind, lapply(names(dd), function(n) {
+    data.frame(name=n,
+               firstrow=dd[1, n],
+               class=class(dd[1, n]),
+               numfactors=length(table(dd[,n])))
+  })))
+}
+  
+getInfo(dd)
+```
+
+Now there are four columns that need to be binned to be useful.
+
+```{r}
+numBins <- 21
+colsToBin <- c("num_lab_procedures", "diag_1", "diag_2", "diag_3")
+for (c in colsToBin){
+  vec <- as.integer(dd[ ,c])
+  from <- min(vec, na.rm=TRUE)
+  to   <- max(vec, na.rm=TRUE)
+  bins <- seq(from, to, length.out=numBins)
+  binned <- cut(vec, breaks=bins)
+  # we'll make this a factor a little later
+  binned <- as.character(binned)
+  dd[ ,c] <- binned
+}
+
+# let's look at our summary again
+getInfo(dd)
+```
+
+Last, we will treat all the NAs as a factor category by replaceing with 'missing' and then coercing each column to a factor.
+
+```{r}
+for (c in names(dd)) {
+  vec <- dd[ ,c]
+  vec[is.na(vec)] <- "missing"
+  dd[ ,c] <- as.factor(vec)
+}
+
+getInfo(dd)
+```
+
+
+Now let's get an idea of the distribution of distances we have.
+
+```{r}
+hamDist <- function(r1, r2) {
+  # The hamming distance between two rows
+  return(sum(r1 == r2))
+}
+
+# We can't compute the distance between all points
+# so we will just sample a large number of distances
+nSamples <- 2000
+n <- nrow(dd)
+dSamples <- unlist(lapply(1:nSamples, function(i) {
+  s <- sample(1:n, 2)
+  hamDist(dd[s[1], ], dd[s[2],])
+}))
+hist(dSamples, breaks=1:30)
+```
+
+## Initializing the Cluster Tree
+
+Okay, I think we can handle about 100 points in main memory (this creates about 5000 combinations). So let's go ahead and sample from our data and create some clusters.
+
+```{r eval=FALSE}
+# ######### #
+# Functions #
+# ######### #
+
+hamDist <- function(r1, r2) {
+  # The hamming distance between two rows
+  return(sum(r1 == r2))
+}
+
+nextPoint <- function(clusters, dist.df, 
+                      index1='index1', index2='index2', 
+                      dist.col='dist') {
+  potential.set <- potentialDF(clusters, dist.df)
+  # find the candidate furthest from existing seeds
+  minClusterDist <- potential.set %>%
+    group_by(candidate) %>%
+    summarize(dist = min(dist))
+  
+  return(minClusterDist$candidate[which.max(minClusterDist$dist)])
+}
+
+assignToCluster <- function(clusters, dist.df, 
+                            index1='index1', index2='index2', 
+                            dist.col='dist') {
+  potential.set <- potentialDF(clusters, dist.df)
+  # Find the point closest to a cluster
+  minClusterDist <- 
+    potential.set %>% group_by(cluster) %>% slice(which.min(dist))
+  assignment <- minClusterDist[which.min(minClusterDist$dist), ]
+  clusters[assignment$candidate[1]] <- assignment$cluster[1]
+  if (sum(clusters == 0) > 0) {
+    cdf <- assignToCluster(clusters, dist.df, index1, index2, dist.col)
+    assignment <- rbind(assignment, cdf)
+  }
+  return(assignment)
+}
+
+hcluster <- function(clusters, dist.df, 
+                     index1='index1', index2='index2', 
+                     dist.col='dist') {
+  dist.df <- dist.df[order(dist.df[dist.col]), ]
+  assign.order <- do.call(rbind, apply(dist.df, 1, function(r) {
+    id1 <- r[index1]
+    id2 <- r[index2]
+    cluster.union <- union(which(clusters == clusters[id1]),
+                           which(clusters == clusters[id2]))
+    clusters[cluster.union] <<- clusters[clusters[id1]]
+    return(list(clusters))
+  }))
+  return(do.call(rbind, assign.order))
+  
+}
+
+potentialDF <- function(clusters, dist.df, 
+                        index1='index1', index2='index2', 
+                        dist.col='dist') {
+  # Break out which points have been assigned and which are candidates
+  candidates <- which(clusters == 0)
+  assigned <- which(clusters != 0)
+  # id vectors
+  id1 <- dist.df[index1]
+  id2 <- dist.df[index2]
+  # create combinations of candidates and assigned
+  potential.set <- expand.grid(candidates, assigned)
+  names(potential.set) <- c('candidate', 'assigned')
+  # add distance information
+  potential.set['dist'] <- 
+    apply(apply(potential.set, 1, sort), 2, function(c) {
+      dist.df[(id1 == c[1] & id2 == c[2]), dist.col]})
+  # add cluster information
+  potential.set['cluster'] <-
+    unlist(lapply(potential.set$assigned, function(i) {clusters[i]}))
+  return(potential.set)
+}
+
+# ### #
+# Run #
+# ### #
+
+# Cluster parameters
+k <- 10
+n <- 5
+
+# Sample from data
+sample.df <- dd[sample(1:nrow(dd), n), ]
+
+# Initialize assignment vector
+tocluster <- rep(0, n)
+
+# Enumerate all combinations of points
+combos.df <- as.data.frame(t(combn(1:n, 2)))
+names(combos.df) <- c("index1", "index2")
+combos.df['dist'] <- unlist(apply(combos.df, 1, function(c){
+    hamDist(sample.df[c[1], ], sample.df[c[2], ])
+  }))
+combos.df['dist.sq'] <- combos.df$dist**2
+
+# Assign first two clusters seeds
+maxd <- combos.df[which.max(combos.df$dist), ]
+tocluster[maxd[1, 1]] <- 1
+tocluster[maxd[1, 2]] <- 2
+
+# Assign the rest of the initial k clusters seeds
+trash <- lapply(3:k, function(i) {
+  nextPt <- nextPoint(tocluster, combos.df)
+  tocluster[nextPt] <<- i
+})
+
+# Now we have our seeds, we need to assign points to clusters
+assignments <- assignToCluster(tocluster, combos.df)
+tocluster[assignments$candidate] <- assignments$cluster
+
+```
+
+At this point we have assigned all our initial points to a cluster. Now we need to create a tree to hold hierarchical relationship between clusters, and we need to store information about each cluster.
+
+```{r, eval=FALSE}
+
+nodes <- list()
+for (i in unique(tocluster)) {
+  nodes[[as.character(i)]] <- list(
+    parent=NA,
+    type='leaf',
+    N=table(tocluster)[i],
+    clustroid=NA,
+    clustroid.rowsum=NA,
+    closest=list(),
+    farthest=list()
+  )
+}
+
+```
+
+
+
+
+
+
+
+
